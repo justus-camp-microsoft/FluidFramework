@@ -656,9 +656,18 @@ describe("schemaBasedEncoding", () => {
 					};
 					const idCompressorCore = toIdCompressorWithCore(idCompressor);
 					idCompressorCore.finalizeCreationRange(idCompressorCore.takeNextCreationRange());
+					const isExperimental = version === FieldBatchFormatVersion.vTextExperimental;
 					const codec = fieldBatchCodecBuilder.build({
 						jsonValidator: ajvValidator,
 						minVersionForCollab: currentVersion,
+						...(isExperimental
+							? {
+									writeVersionOverrides: new Map([
+										[fieldBatchCodecBuilder.name, FieldBatchFormatVersion.vTextExperimental],
+									]),
+									allowPossiblyIncompatibleWriteVersionOverrides: true,
+								}
+							: {}),
 					});
 					// End to end test
 					// rootFieldSchema is not being used in encoding, so we currently have some limitations. Schema based optimizations for root case don't trigger.

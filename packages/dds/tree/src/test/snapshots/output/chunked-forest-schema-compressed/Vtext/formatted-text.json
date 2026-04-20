@@ -1,0 +1,335 @@
+{
+  "version": "text",
+  "identifiers": [
+    "",
+    "bold",
+    "italic",
+    "underline",
+    "com.fluidframework.leaf.boolean"
+  ],
+  "shapes": [
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.StringTextAtom",
+        "value": false,
+        "fields": [
+          [
+            0,
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "f": {
+        "base": 7,
+        "fields": [
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            2
+          ],
+          [
+            3,
+            2
+          ]
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": 4,
+        "value": [
+          false
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": 4,
+        "value": true
+      }
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.leaf.string",
+        "value": true
+      }
+    },
+    {
+      "d": 0
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.Text",
+        "value": false,
+        "fields": [
+          [
+            0,
+            9
+          ]
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.CharacterFormat",
+        "value": false,
+        "fields": [
+          [
+            1,
+            3
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            3
+          ],
+          [
+            "size",
+            8
+          ],
+          [
+            "font",
+            4
+          ]
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.leaf.number",
+        "value": true
+      }
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.StringArray",
+        "value": false,
+        "fields": [
+          [
+            0,
+            10
+          ]
+        ]
+      }
+    },
+    {
+      "a": 11
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.StringAtom",
+        "value": false,
+        "fields": [
+          [
+            0,
+            5
+          ],
+          [
+            "format",
+            5
+          ]
+        ]
+      }
+    }
+  ],
+  "data": [
+    [
+      6,
+      [
+        0,
+        "H",
+        1,
+        12,
+        "Arial",
+        0,
+        "e",
+        1,
+        12,
+        "Arial",
+        0,
+        "l",
+        1,
+        12,
+        "Arial",
+        0,
+        "l",
+        1,
+        12,
+        "Arial",
+        0,
+        "o",
+        1,
+        12,
+        "Arial",
+        0,
+        ",",
+        1,
+        12,
+        "Arial",
+        0,
+        " ",
+        1,
+        12,
+        "Arial",
+        0,
+        "w",
+        1,
+        12,
+        "Arial",
+        0,
+        "o",
+        1,
+        12,
+        "Arial",
+        0,
+        "r",
+        1,
+        12,
+        "Arial",
+        0,
+        "l",
+        1,
+        12,
+        "Arial",
+        0,
+        "d",
+        1,
+        12,
+        "Arial",
+        0,
+        "!",
+        1,
+        12,
+        "Arial",
+        0,
+        " ",
+        1,
+        12,
+        "Arial",
+        0,
+        "T",
+        1,
+        12,
+        "Arial",
+        0,
+        "h",
+        1,
+        12,
+        "Arial",
+        0,
+        "i",
+        1,
+        12,
+        "Arial",
+        0,
+        "s",
+        1,
+        12,
+        "Arial",
+        0,
+        " ",
+        1,
+        12,
+        "Arial",
+        0,
+        "i",
+        1,
+        12,
+        "Arial",
+        0,
+        "s",
+        1,
+        12,
+        "Arial",
+        0,
+        " ",
+        1,
+        12,
+        "Arial",
+        0,
+        "f",
+        1,
+        12,
+        "Arial",
+        0,
+        "o",
+        1,
+        12,
+        "Arial",
+        0,
+        "r",
+        1,
+        12,
+        "Arial",
+        0,
+        "m",
+        1,
+        12,
+        "Arial",
+        0,
+        "a",
+        1,
+        12,
+        "Arial",
+        0,
+        "t",
+        1,
+        12,
+        "Arial",
+        0,
+        "t",
+        1,
+        12,
+        "Arial",
+        0,
+        "e",
+        1,
+        12,
+        "Arial",
+        0,
+        "d",
+        1,
+        12,
+        "Arial",
+        0,
+        " ",
+        1,
+        12,
+        "Arial",
+        0,
+        "t",
+        1,
+        12,
+        "Arial",
+        0,
+        "e",
+        1,
+        12,
+        "Arial",
+        0,
+        "x",
+        1,
+        12,
+        "Arial",
+        0,
+        "t",
+        1,
+        12,
+        "Arial",
+        0,
+        ".",
+        1,
+        12,
+        "Arial"
+      ]
+    ]
+  ]
+}
