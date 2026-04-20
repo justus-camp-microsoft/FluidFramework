@@ -53,15 +53,20 @@ export function compressedEncode(
 	fieldBatch: FieldBatch,
 	context: EncoderContext,
 ): EncodedFieldBatchV1OrV2 {
-	const batchBuffer: BufferFormat[] = [];
+	const onComplete = context.preEncodeHook?.(fieldBatch, context);
+	try {
+		const batchBuffer: BufferFormat[] = [];
 
-	// Populate buffer, including shape and identifier references
-	for (const cursor of fieldBatch) {
-		const buffer: BufferFormat = [];
-		anyFieldEncoder.encodeField(cursor, context, buffer);
-		batchBuffer.push(buffer);
+		// Populate buffer, including shape and identifier references
+		for (const cursor of fieldBatch) {
+			const buffer: BufferFormat = [];
+			anyFieldEncoder.encodeField(cursor, context, buffer);
+			batchBuffer.push(buffer);
+		}
+		return updateShapesAndIdentifiersEncoding(context.version, batchBuffer);
+	} finally {
+		onComplete?.();
 	}
-	return updateShapesAndIdentifiersEncoding(context.version, batchBuffer);
 }
 
 export type BufferFormat = BufferFormatGeneric<EncodedChunkShape>;
@@ -540,6 +545,15 @@ export class EncoderContext implements NodeEncodeBuilder, FieldEncodeBuilder {
 		 * See {@link FieldBatchEncodingContext.isSummary}.
 		 */
 		public readonly isSummary: boolean,
+		/**
+		 * Optional hook invoked at the start of every {@link compressedEncode} call (including
+		 * the recursive sub-chunk calls made by {@link incrementalFieldEncoder}). Used by
+		 * encoder policies that need per-batch state — e.g. the VText two-pass encoder uses it
+		 * to snapshot/restore per-batch specialization state and to run its counting pass.
+		 * @remarks
+		 * See {@link PreEncodeHook}.
+		 */
+		public readonly preEncodeHook: PreEncodeHook | undefined = undefined,
 	) {}
 
 	public nodeEncoderFromSchema(schemaName: TreeNodeSchemaIdentifier): NodeEncoder {
@@ -580,6 +594,18 @@ export type NodeEncoderPolicy = (
 	fieldBuilder: FieldEncodeBuilder,
 	schemaName: TreeNodeSchemaIdentifier,
 ) => NodeEncoder;
+
+/**
+ * Hook for {@link EncoderContext.preEncodeHook}: invoked at the start of every
+ * {@link compressedEncode} call. May optionally return a cleanup callback that is invoked
+ * (in a `finally` block) after the encode completes — typically used to restore state
+ * snapshotted at hook entry, so recursive sub-chunk encodes do not corrupt the outer
+ * batch's state when they unwind.
+ */
+export type PreEncodeHook = (
+	fieldBatch: FieldBatch,
+	context: EncoderContext,
+) => (() => void) | undefined;
 
 class LazyFieldEncoder implements FieldEncoder {
 	private encoderLazy: FieldEncoder | undefined;

@@ -26,6 +26,7 @@ import {
 } from "./compressedEncode.js";
 import type {
 	EncodedChunkShape,
+	EncodedChunkShapeVTextExperimental,
 	EncodedFieldShape,
 	EncodedValueShape,
 } from "./format/index.js";
@@ -157,6 +158,81 @@ export class NodeShapeBasedEncoder extends Shape<EncodedChunkShape> implements N
 	}
 
 	public get shape(): Shape<EncodedChunkShape> {
+		return this;
+	}
+}
+
+/**
+ * Encodes a node with the {@link EncodedSpecializedNodeShape} (`f`) shape.
+ *
+ * Wraps a base {@link NodeShapeBasedEncoder} and overlays a set of field overrides — fields
+ * whose shapes differ from the base. The merged field list (base fields with overrides applied,
+ * plus any new fields appended) is used for data encoding, while `encodeShape` emits the compact
+ * `{f: {base, fields}}` wire format instead of repeating the full node shape.
+ */
+export class SpecializedNodeShapeEncoder
+	extends Shape<EncodedChunkShape>
+	implements NodeEncoder
+{
+	private readonly inner: NodeShapeBasedEncoder;
+
+	public constructor(
+		private readonly base: NodeShapeBasedEncoder,
+		public readonly fieldOverrides: readonly KeyedFieldEncoder[],
+	) {
+		super();
+		const overrideMap = new Map(fieldOverrides.map((kfe) => [kfe.key, kfe]));
+		const mergedFields: KeyedFieldEncoder[] = base.specializedFieldEncoders.map(
+			(kfe) => overrideMap.get(kfe.key) ?? kfe,
+		);
+		for (const override of fieldOverrides) {
+			if (!base.specializedFieldEncoders.some((f) => f.key === override.key)) {
+				mergedFields.push(override);
+			}
+		}
+		this.inner = new NodeShapeBasedEncoder(
+			base.type,
+			base.value,
+			mergedFields,
+			base.otherFieldsEncoder,
+		);
+	}
+
+	public encodeNode(
+		cursor: ITreeCursorSynchronous,
+		context: EncoderContext,
+		outputBuffer: BufferFormat<EncodedChunkShape>,
+	): void {
+		this.inner.encodeNode(cursor, context, outputBuffer);
+	}
+
+	public encodeShape(
+		identifiers: DeduplicationTable<string>,
+		shapes: DeduplicationTable<Shape<EncodedChunkShape>>,
+	): EncodedChunkShapeVTextExperimental {
+		const baseIndex =
+			shapes.valueToIndex.get(this.base) ??
+			fail("SpecializedNodeShapeEncoder: base shape missing from shapes table");
+		return {
+			f: {
+				base: baseIndex,
+				fields: encodeFieldShapes(this.fieldOverrides, identifiers, shapes) ?? [],
+			},
+		};
+	}
+
+	public countReferencedShapesAndIdentifiers(
+		identifiers: Counter<string>,
+		shapeDiscovered: (shape: Shape<EncodedChunkShape>) => void,
+	): void {
+		shapeDiscovered(this.base);
+		for (const override of this.fieldOverrides) {
+			identifiers.add(override.key);
+			shapeDiscovered(override.encoder.shape);
+		}
+	}
+
+	public get shape(): this {
 		return this;
 	}
 }
