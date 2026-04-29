@@ -3,13 +3,16 @@
   "identifiers": [],
   "shapes": [
     {
+      "d": 0
+    },
+    {
       "c": {
         "type": "test.hasIdentifierField",
         "value": false,
         "fields": [
           [
             "field",
-            1
+            2
           ]
         ]
       }
@@ -24,6 +27,7 @@
   "data": [
     [
       0,
+      1,
       0
     ]
   ]

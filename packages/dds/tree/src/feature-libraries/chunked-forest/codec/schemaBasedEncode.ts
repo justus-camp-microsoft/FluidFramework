@@ -35,6 +35,7 @@ import {
 	type KeyedFieldEncoder,
 	type NodeEncoder,
 	type NodeEncodeBuilder,
+	type Shape,
 	anyNodeEncoder,
 	asFieldEncoder,
 	compressedEncode,
@@ -167,16 +168,20 @@ function countFieldUnlessIncremental(
 		return;
 	}
 	forEachNode(cursor, () => {
+		// Walk children first (post-order) so leaf-value cohorts and inner object cohorts have
+		// their counts and threshold decisions populated before this node's cohort key is built.
+		// {@link VTextObjectNodeEncoder.countNode} computes its tuple via `resolveShape` on each
+		// child encoder, which is only correct after the child has been fully counted.
+		const nodeType: string = cursor.type;
+		forEachField(cursor, () => {
+			countFieldUnlessIncremental(cursor, context, nodeType, shouldEncodeIncrementally);
+		});
 		const encoder = context.nodeEncoderFromSchema(cursor.type);
 		if (encoder instanceof VTextObjectNodeEncoder) {
 			encoder.countNode(cursor);
 		} else if (encoder instanceof VTextLeafNodeEncoder) {
 			encoder.countNode(cursor);
 		}
-		const nodeType: string = cursor.type;
-		forEachField(cursor, () => {
-			countFieldUnlessIncremental(cursor, context, nodeType, shouldEncodeIncrementally);
-		});
 	});
 }
 
@@ -237,7 +242,23 @@ function buildContextVText(
 			for (const enc of vTextLeafEncoders) {
 				leafSnapshots.set(enc, enc.swapBatchState());
 			}
-			countVTextSpecializationCandidates(fieldBatch, ctx);
+			// Multi-pass count: each iteration's `resolveShape` reads counts populated by the
+			// previous iteration, so cohort decisions propagate up the tree one nesting level
+			// per pass. Iterates until counts stabilize, bounded by COUNT_PASS_MAX_ITERATIONS.
+			// For text-domain schemas convergence is reached in ~2–4 passes; the bound exists
+			// to defend against pathological cases (e.g. a deeply recursive schema where
+			// thresholds keep flipping).
+			for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
+				countVTextSpecializationCandidates(fieldBatch, ctx);
+				let changed = false;
+				for (const enc of vTextEncoders) {
+					if (enc.commitCountIteration()) changed = true;
+				}
+				for (const enc of vTextLeafEncoders) {
+					if (enc.commitCountIteration()) changed = true;
+				}
+				if (!changed) break;
+			}
 			return () => {
 				for (const enc of vTextEncoders) {
 					const snapshot = objectSnapshots.get(enc);
@@ -304,28 +325,35 @@ function getNodeEncoderVText(
 		return baseEncoder;
 	}
 
-	const boolFields: { key: FieldKey; type: TreeNodeSchemaIdentifier }[] = [];
+	const specializableFields: SpecializableField[] = [];
 	if (schema instanceof ObjectNodeStoredSchema) {
 		for (const [key, field] of schema.objectNodeFields ?? []) {
+			if (context.fieldShapes.get(field.kind)?.multiplicity !== Multiplicity.Single) {
+				continue;
+			}
 			const type = oneFromIterable(field.types);
 			if (type === undefined) {
+				// Polymorphic field: cohort key uses the resolved sub-shape per instance.
+				// Cohorts only fire when all instances pick the same sub-shape (which implies
+				// the same cursor.type), so the override pinning that shape is sound.
+				specializableFields.push({ kind: "subShape", key });
 				continue;
 			}
 			const nodeSchema = storedSchema.nodeSchema.get(type);
 			if (
-				!(nodeSchema instanceof LeafNodeStoredSchema) ||
-				nodeSchema.leafValue !== ValueSchema.Boolean
+				nodeSchema instanceof LeafNodeStoredSchema &&
+				(nodeSchema.leafValue === ValueSchema.Boolean ||
+					nodeSchema.leafValue === ValueSchema.String ||
+					nodeSchema.leafValue === ValueSchema.Number)
 			) {
-				continue;
+				specializableFields.push({ kind: "leafValue", key, leafType: type });
+			} else {
+				specializableFields.push({ kind: "subShape", key });
 			}
-			if (context.fieldShapes.get(field.kind)?.multiplicity !== Multiplicity.Single) {
-				continue;
-			}
-			boolFields.push({ key, type });
 		}
 	}
 
-	if (boolFields.length === 0) {
+	if (specializableFields.length === 0) {
 		return baseEncoder;
 	}
 
@@ -333,7 +361,12 @@ function getNodeEncoderVText(
 		baseEncoder instanceof NodeShapeBasedEncoder,
 		"VText node encoder policy expects NodeShapeBasedEncoder as base",
 	);
-	return new VTextObjectNodeEncoder(baseEncoder, boolFields, minOccurrencesForSpecialization);
+	return new VTextObjectNodeEncoder(
+		baseEncoder,
+		specializableFields,
+		minOccurrencesForSpecialization,
+		context,
+	);
 }
 
 /**
@@ -351,8 +384,20 @@ function getNodeEncoderVText(
 const DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION = 8;
 
 /**
- * Encodes ObjectNodes using {@link SpecializedNodeShapeEncoder} shapes that constant-fold
- * required single-valued boolean leaf fields.
+ * Upper bound on iterations of the multi-pass VText count loop. Each pass propagates
+ * threshold decisions one nesting level up: leaf cohorts settle in pass 1, immediate
+ * parents in pass 2, and so on. For typical text-domain schemas this converges in
+ * 2–4 passes; the cap is a safety net against pathological cases where thresholds
+ * flip between passes (e.g. inputs that bunch right at the threshold in a recursive
+ * schema). Hitting the cap doesn't break encoding — encode falls back to whatever
+ * counts the last iteration produced — but it would mean some cohorts that *could*
+ * have specialized end up using the base shape.
+ */
+const COUNT_PASS_MAX_ITERATIONS = 10;
+
+/**
+ * Encodes ObjectNodes using {@link SpecializedNodeShapeEncoder} shapes that constant-fold the
+ * required single-valued fields whose contents are predictable across the cohort.
  *
  * Used in a two-pass encode: a counting pass ({@link countNode}) records each tuple's
  * occurrence count, after which the encoding pass ({@link encodeNode}) consults those counts
@@ -360,31 +405,74 @@ const DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION = 8;
  * {@link MIN_OCCURRENCES_FOR_SPECIALIZATION} times use a specialized shape for *all* their
  * occurrences; rarer tuples encode through the base shape. The parent field uses
  * {@link AnyShape} dispatch so each node can carry its own shape index — paying one extra
- * dispatch token per node but saving one token per boolean field that gets embedded as a
- * constant in the specialized shape.
+ * dispatch token per node but saving one token per field that gets embedded as a constant
+ * (or pinned to a child cohort shape) in the specialized shape.
+ *
+ * @remarks
+ * Two flavors of field specialization are supported. `leafValue` covers required single-valued
+ * boolean, string, or number leaf fields: the cohort key includes the field's value, and the
+ * cohort's field override pins a constant-value shape that emits zero data per instance.
+ * `subShape` covers required single-valued fields whose content is itself encoded by an
+ * encoder that can produce different shapes per instance (a {@link VTextLeafNodeEncoder} or
+ * {@link VTextObjectNodeEncoder}, transitively): the cohort key includes the resolved
+ * sub-shape (by reference identity) and the cohort's field override pins that sub-shape, which
+ * may itself be a specialized cohort emitting zero data — allowing wins to compound across
+ * nesting levels.
+ *
+ * For correctness with nested composition, the count pass walks the tree in post-order: a
+ * parent's cohort key is computed only after its children's counts are populated, so the
+ * parent's `resolveShape` calls on its children return the cohort decisions those children
+ * will make at encode time.
  */
+type SpecializableField =
+	| {
+			readonly kind: "leafValue";
+			readonly key: FieldKey;
+			readonly leafType: TreeNodeSchemaIdentifier;
+	  }
+	| { readonly kind: "subShape"; readonly key: FieldKey };
+
 /**
  * Per-batch state for a {@link VTextObjectNodeEncoder}. Snapshotted/restored by the VText
  * preEncodeHook so recursive sub-chunk encodes (via {@link incrementalFieldEncoder}) make
  * specialization decisions scoped to *their* batch without corrupting the outer batch.
  */
 interface VTextBatchState {
+	/**
+	 * Counts being populated by the current count-pass iteration. After each iteration, copied
+	 * to {@link resolveCounts} so the next iteration's `resolveShape` calls see them.
+	 */
 	counts: Map<string, number>;
+	/**
+	 * Counts from the previous count-pass iteration, consulted by {@link resolveShape} to make
+	 * threshold decisions. Empty during the first iteration; equal to {@link counts} after the
+	 * count loop converges, at which point the encode pass can read it as the final count map.
+	 */
+	resolveCounts: Map<string, number>;
 	specializedEncoders: Map<string, SpecializedNodeShapeEncoder>;
 }
 
 function emptyVTextBatchState(): VTextBatchState {
-	return { counts: new Map(), specializedEncoders: new Map() };
+	return { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
 }
 
 class VTextObjectNodeEncoder implements NodeEncoder {
 	private readonly constantNodeEncoders: Map<string, NodeShapeBasedEncoder> = new Map();
+	/**
+	 * Stable per-encoder identifiers for {@link Shape} instances appearing as a `subShape`
+	 * field's resolved shape. Used only to build a string cohort key — keying on the Shape
+	 * directly would also work, but stringifying the tuple gives a single primitive key for
+	 * the counts/encoder maps.
+	 */
+	private readonly shapeIds: Map<Shape, number> = new Map();
+	private nextShapeId = 0;
 	private batch: VTextBatchState = emptyVTextBatchState();
 
 	public constructor(
 		private readonly base: NodeShapeBasedEncoder,
-		private readonly boolFields: readonly { key: FieldKey; type: TreeNodeSchemaIdentifier }[],
+		private readonly specializableFields: readonly SpecializableField[],
 		private readonly minOccurrencesForSpecialization: number,
+		private readonly nodeBuilder: NodeEncodeBuilder,
 	) {}
 
 	public get shape(): AnyShape {
@@ -393,17 +481,20 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 
 	/**
 	 * Counting-pass entry point. Records this node's tuple key without producing output.
+	 * Must be called *after* counting any children whose encoders contribute to this node's
+	 * {@link SpecializableField} resolution — otherwise their `resolveShape` returns the base
+	 * encoder before their own threshold has been observed, and the parent under-discriminates.
 	 */
 	public countNode(cursor: ITreeCursorSynchronous): void {
-		const key = this.readBoolValues(cursor).join(",");
+		const key = this.cohortKey(cursor);
 		this.batch.counts.set(key, (this.batch.counts.get(key) ?? 0) + 1);
 	}
 
 	/**
 	 * Replace the active batch state with a fresh empty one and return the previous state.
 	 * Used by the VText preEncodeHook to snapshot/restore around recursive sub-chunk encodes.
-	 * {@link constantNodeEncoders} is *not* swapped — it is a stateless leaf-shape cache that
-	 * is safe (and beneficial) to share across batches.
+	 * {@link constantNodeEncoders} and {@link shapeIds} are *not* swapped — they are stateless
+	 * caches that are safe (and beneficial) to share across batches.
 	 */
 	public swapBatchState(): VTextBatchState {
 		const previous = this.batch;
@@ -423,42 +514,130 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 		context: EncoderContext,
 		outputBuffer: BufferFormat,
 	): void {
-		const boolValues = this.readBoolValues(cursor);
-		const key = boolValues.join(",");
-		let specialized = this.batch.specializedEncoders.get(key);
-		if (
-			specialized === undefined &&
-			(this.batch.counts.get(key) ?? 0) >= this.minOccurrencesForSpecialization
-		) {
-			specialized = this.createSpecialized(boolValues);
-			this.batch.specializedEncoders.set(key, specialized);
+		const resolved = this.resolveShape(cursor);
+		if (resolved instanceof SpecializedNodeShapeEncoder) {
+			this.batch.specializedEncoders.set(this.cohortKey(cursor), resolved);
 		}
-		AnyShape.encodeNode(cursor, context, outputBuffer, specialized ?? this.base);
+		AnyShape.encodeNode(cursor, context, outputBuffer, resolved);
 	}
 
-	private readBoolValues(cursor: ITreeCursorSynchronous): boolean[] {
-		return this.boolFields.map(({ key }) => {
-			cursor.enterField(brand(key));
+	/**
+	 * Returns the {@link NodeEncoder} this encoder will dispatch to for the cursor's current
+	 * node: the cached specialized cohort if the node's tuple has crossed the threshold,
+	 * otherwise the base encoder. Safe to call from a parent encoder — never mutates
+	 * {@link batch.counts}, and caches its newly-created specialized instance in
+	 * {@link batch.specializedEncoders} so subsequent calls (within the same iteration of the
+	 * count loop, and in the encode pass) return the *same* shape reference. That stability
+	 * is load-bearing: a parent encoder uses the resolved shape's identity to build its own
+	 * cohort key via {@link idForShape}, so creating a fresh cohort instance per call would
+	 * give every parent instance a unique key and prevent the parent cohort from firing.
+	 */
+	public resolveShape(
+		cursor: ITreeCursorSynchronous,
+	): NodeShapeBasedEncoder | SpecializedNodeShapeEncoder {
+		const key = this.cohortKey(cursor);
+		const existing = this.batch.specializedEncoders.get(key);
+		if (existing !== undefined) {
+			return existing;
+		}
+		if ((this.batch.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
+			const specialized = this.createSpecialized(cursor);
+			this.batch.specializedEncoders.set(key, specialized);
+			return specialized;
+		}
+		return this.base;
+	}
+
+	/**
+	 * Promote {@link batch.counts} to {@link batch.resolveCounts} for the next count-pass
+	 * iteration (or for the encode pass), and return whether the new counts differ from the
+	 * previous resolveCounts — the multi-pass count loop uses this to detect a fixed point.
+	 */
+	public commitCountIteration(): boolean {
+		const previous = this.batch.resolveCounts;
+		const current = this.batch.counts;
+		let changed = previous.size !== current.size;
+		if (!changed) {
+			for (const [k, v] of current) {
+				if (previous.get(k) !== v) {
+					changed = true;
+					break;
+				}
+			}
+		}
+		this.batch.resolveCounts = new Map(current);
+		this.batch.counts = new Map();
+		return changed;
+	}
+
+	/**
+	 * Build the cohort key for the node at the cursor's current position. Each
+	 * {@link SpecializableField} contributes one segment:
+	 *
+	 * - `leafValue`: the field's leaf value (type-tagged via {@link valueKey}).
+	 * - `subShape`: the per-encoder ID of the resolved child shape (reference identity).
+	 */
+	private cohortKey(cursor: ITreeCursorSynchronous): string {
+		const parts: string[] = [];
+		for (const field of this.specializableFields) {
+			cursor.enterField(brand(field.key));
 			const hasNode = cursor.firstNode();
-			assert(hasNode, "required boolean field must contain a node");
-			const value = cursor.value as boolean;
+			assert(hasNode, "required specializable field must contain a node");
+			if (field.kind === "leafValue") {
+				parts.push(`L:${valueKey(cursor.value)}`);
+			} else {
+				const childEncoder = this.nodeBuilder.nodeEncoderFromSchema(cursor.type);
+				const childShape =
+					childEncoder instanceof VTextLeafNodeEncoder ||
+					childEncoder instanceof VTextObjectNodeEncoder
+						? childEncoder.resolveShape(cursor)
+						: childEncoder.shape;
+				parts.push(`S:${this.idForShape(childShape)}`);
+			}
 			cursor.exitNode();
 			cursor.exitField();
-			return value;
-		});
+		}
+		return parts.join("|");
 	}
 
-	private createSpecialized(boolValues: readonly boolean[]): SpecializedNodeShapeEncoder {
+	private idForShape(shape: Shape): number {
+		let id = this.shapeIds.get(shape);
+		if (id === undefined) {
+			id = this.nextShapeId++;
+			this.shapeIds.set(shape, id);
+		}
+		return id;
+	}
+
+	private createSpecialized(cursor: ITreeCursorSynchronous): SpecializedNodeShapeEncoder {
 		const overrides: KeyedFieldEncoder[] = [];
-		for (const [i, { key, type }] of this.boolFields.entries()) {
-			const value = boolValues[i] as boolean;
-			const cacheKey = `${type}:${value}`;
-			let nodeEncoder = this.constantNodeEncoders.get(cacheKey);
-			if (nodeEncoder === undefined) {
-				nodeEncoder = new NodeShapeBasedEncoder(type, [value], [], undefined);
-				this.constantNodeEncoders.set(cacheKey, nodeEncoder);
+		for (const field of this.specializableFields) {
+			cursor.enterField(brand(field.key));
+			const hasNode = cursor.firstNode();
+			assert(hasNode, "required specializable field must contain a node");
+			if (field.kind === "leafValue") {
+				const value = cursor.value;
+				const cacheKey = `${field.leafType}:${valueKey(value)}`;
+				let nodeEncoder = this.constantNodeEncoders.get(cacheKey);
+				if (nodeEncoder === undefined) {
+					nodeEncoder = new NodeShapeBasedEncoder(field.leafType, [value], [], undefined);
+					this.constantNodeEncoders.set(cacheKey, nodeEncoder);
+				}
+				overrides.push({ key: field.key, encoder: asFieldEncoder(nodeEncoder) });
+			} else {
+				const childEncoder = this.nodeBuilder.nodeEncoderFromSchema(cursor.type);
+				const resolvedChild =
+					childEncoder instanceof VTextLeafNodeEncoder ||
+					childEncoder instanceof VTextObjectNodeEncoder
+						? childEncoder.resolveShape(cursor)
+						: childEncoder;
+				overrides.push({
+					key: field.key,
+					encoder: asFieldEncoder(resolvedChild),
+				});
 			}
-			overrides.push({ key, encoder: asFieldEncoder(nodeEncoder) });
+			cursor.exitNode();
+			cursor.exitField();
 		}
 		return new SpecializedNodeShapeEncoder(this.base, overrides);
 	}
@@ -471,11 +650,12 @@ class VTextObjectNodeEncoder implements NodeEncoder {
  */
 interface VTextLeafBatchState {
 	counts: Map<string, number>;
+	resolveCounts: Map<string, number>;
 	specializedEncoders: Map<string, SpecializedNodeShapeEncoder>;
 }
 
 function emptyVTextLeafBatchState(): VTextLeafBatchState {
-	return { counts: new Map(), specializedEncoders: new Map() };
+	return { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
 }
 
 /**
@@ -530,17 +710,54 @@ class VTextLeafNodeEncoder implements NodeEncoder {
 		context: EncoderContext,
 		outputBuffer: BufferFormat,
 	): void {
+		const resolved = this.resolveShape(cursor);
+		if (resolved instanceof SpecializedNodeShapeEncoder) {
+			this.batch.specializedEncoders.set(valueKey(cursor.value), resolved);
+		}
+		AnyShape.encodeNode(cursor, context, outputBuffer, resolved);
+	}
+
+	/**
+	 * Returns the {@link NodeEncoder} this encoder will dispatch to for the cursor's current
+	 * value: the cached specialized cohort if the value's count has crossed the threshold,
+	 * otherwise the base encoder. Safe to call from a parent encoder's count pass — it never
+	 * mutates {@link batch.counts}, and the cached specialized instance is reused at encode time.
+	 */
+	public resolveShape(
+		cursor: ITreeCursorSynchronous,
+	): NodeShapeBasedEncoder | SpecializedNodeShapeEncoder {
 		const value = cursor.value;
 		const key = valueKey(value);
-		let specialized = this.batch.specializedEncoders.get(key);
-		if (
-			specialized === undefined &&
-			(this.batch.counts.get(key) ?? 0) >= this.minOccurrencesForSpecialization
-		) {
-			specialized = this.getOrCreateSpecialized(key, value);
-			this.batch.specializedEncoders.set(key, specialized);
+		const existing = this.batch.specializedEncoders.get(key);
+		if (existing !== undefined) {
+			return existing;
 		}
-		AnyShape.encodeNode(cursor, context, outputBuffer, specialized ?? this.base);
+		if ((this.batch.resolveCounts.get(key) ?? 0) >= this.minOccurrencesForSpecialization) {
+			return this.getOrCreateSpecialized(key, value);
+		}
+		return this.base;
+	}
+
+	/**
+	 * Promote {@link batch.counts} to {@link batch.resolveCounts} for the next count-pass
+	 * iteration (or the encode pass), and return whether the new counts differ from the
+	 * previous resolveCounts — the multi-pass count loop uses this to detect a fixed point.
+	 */
+	public commitCountIteration(): boolean {
+		const previous = this.batch.resolveCounts;
+		const current = this.batch.counts;
+		let changed = previous.size !== current.size;
+		if (!changed) {
+			for (const [k, v] of current) {
+				if (previous.get(k) !== v) {
+					changed = true;
+					break;
+				}
+			}
+		}
+		this.batch.resolveCounts = new Map(current);
+		this.batch.counts = new Map();
+		return changed;
 	}
 
 	private getOrCreateSpecialized(key: string, value: Value): SpecializedNodeShapeEncoder {

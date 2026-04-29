@@ -314,6 +314,21 @@ export const testTrees: readonly TestTree[] = [
 			),
 		policy: defaultSchemaPolicy,
 	},
+	{
+		name: "formatted-text-uniform",
+		schemaData: toStoredSchema(
+			FormattedTextAsTree.Tree,
+			permissiveStoredSchemaGenerationOptions,
+		),
+		treeFactory: (): JsonableTree[] =>
+			jsonableTreeFromFieldCursor(
+				fieldCursorFromInsertable<UnsafeUnknownSchema>(
+					FormattedTextAsTree.Tree,
+					FormattedTextAsTree.Tree.fromString("a".repeat(20)),
+				),
+			),
+		policy: defaultSchemaPolicy,
+	},
 	test(
 		"numericSequence",
 		{

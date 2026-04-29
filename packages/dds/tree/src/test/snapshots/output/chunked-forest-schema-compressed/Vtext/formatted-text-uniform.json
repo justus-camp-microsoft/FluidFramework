@@ -2,22 +2,16 @@
   "version": "text",
   "identifiers": [
     "",
-    "com.fluidframework.leaf.string",
     "format",
     "bold",
     "italic",
     "underline",
     "size",
     "font",
+    "com.fluidframework.leaf.string",
     "com.fluidframework.leaf.boolean"
   ],
   "shapes": [
-    {
-      "c": {
-        "type": 1,
-        "value": true
-      }
-    },
     {
       "d": 0
     },
@@ -42,28 +36,28 @@
         "fields": [
           [
             0,
-            13
+            14
           ]
         ]
       }
     },
     {
       "b": {
-        "length": 37,
-        "shape": 6
+        "length": 20,
+        "shape": 5
       }
     },
     {
       "f": {
-        "base": 7,
+        "base": 6,
         "fields": [
           [
             0,
-            8
+            7
           ],
           [
-            2,
-            9
+            1,
+            8
           ]
         ]
       }
@@ -75,50 +69,49 @@
         "fields": [
           [
             0,
-            1
+            0
           ],
           [
-            2,
-            1
-          ]
-        ]
-      }
-    },
-    {
-      "c": {
-        "type": "com.fluidframework.text.formatted.StringTextAtom",
-        "value": false,
-        "fields": [
-          [
-            0,
-            1
+            1,
+            0
           ]
         ]
       }
     },
     {
       "f": {
-        "base": 10,
+        "base": 12,
         "fields": [
           [
+            0,
+            13
+          ]
+        ]
+      }
+    },
+    {
+      "f": {
+        "base": 9,
+        "fields": [
+          [
+            2,
+            1
+          ],
+          [
             3,
-            2
+            1
           ],
           [
             4,
-            2
+            1
           ],
           [
             5,
-            2
+            10
           ],
           [
             6,
             11
-          ],
-          [
-            7,
-            12
           ]
         ]
       }
@@ -129,24 +122,24 @@
         "value": false,
         "fields": [
           [
+            2,
+            2
+          ],
+          [
             3,
-            3
+            2
           ],
           [
             4,
-            3
+            2
           ],
           [
             5,
-            3
+            0
           ],
           [
             6,
-            1
-          ],
-          [
-            7,
-            1
+            0
           ]
         ]
       }
@@ -161,9 +154,29 @@
     },
     {
       "c": {
-        "type": 1,
+        "type": 7,
         "value": [
           "Arial"
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": "com.fluidframework.text.formatted.StringTextAtom",
+        "value": false,
+        "fields": [
+          [
+            0,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "c": {
+        "type": 7,
+        "value": [
+          "a"
         ]
       }
     },
@@ -174,95 +187,21 @@
         "fields": [
           [
             0,
-            14
+            15
           ]
         ]
       }
     },
     {
-      "a": 1
+      "a": 0
     }
   ],
   "data": [
     [
-      1,
-      4,
+      0,
+      3,
       [
-        5,
-        0,
-        "H",
-        0,
-        "e",
-        0,
-        "l",
-        0,
-        "l",
-        0,
-        "o",
-        0,
-        ",",
-        0,
-        " ",
-        0,
-        "w",
-        0,
-        "o",
-        0,
-        "r",
-        0,
-        "l",
-        0,
-        "d",
-        0,
-        "!",
-        0,
-        " ",
-        0,
-        "T",
-        0,
-        "h",
-        0,
-        "i",
-        0,
-        "s",
-        0,
-        " ",
-        0,
-        "i",
-        0,
-        "s",
-        0,
-        " ",
-        0,
-        "f",
-        0,
-        "o",
-        0,
-        "r",
-        0,
-        "m",
-        0,
-        "a",
-        0,
-        "t",
-        0,
-        "t",
-        0,
-        "e",
-        0,
-        "d",
-        0,
-        " ",
-        0,
-        "t",
-        0,
-        "e",
-        0,
-        "x",
-        0,
-        "t",
-        0,
-        "."
+        4
       ]
     ]
   ]

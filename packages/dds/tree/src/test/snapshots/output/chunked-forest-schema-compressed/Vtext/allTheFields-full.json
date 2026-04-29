@@ -3,16 +3,16 @@
   "identifiers": [],
   "shapes": [
     {
+      "d": 0
+    },
+    {
       "c": {
         "type": "com.fluidframework.leaf.number",
         "value": true
       }
     },
     {
-      "a": 2
-    },
-    {
-      "d": 0
+      "a": 0
     },
     {
       "c": {
@@ -21,15 +21,15 @@
         "fields": [
           [
             "optional",
-            1
-          ],
-          [
-            "valueField",
             2
           ],
           [
+            "valueField",
+            0
+          ],
+          [
             "sequence",
-            1
+            2
           ]
         ]
       }
@@ -37,15 +37,16 @@
   ],
   "data": [
     [
+      0,
       3,
       [
-        0,
+        1,
         5
       ],
-      0,
+      1,
       5,
       [
-        0,
+        1,
         5
       ]
     ]

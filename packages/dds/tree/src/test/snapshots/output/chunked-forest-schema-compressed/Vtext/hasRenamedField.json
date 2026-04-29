@@ -3,13 +3,16 @@
   "identifiers": [],
   "shapes": [
     {
+      "d": 0
+    },
+    {
       "c": {
         "type": "test.hasRenamedField",
         "value": false,
         "fields": [
           [
             "stored-name",
-            1
+            2
           ]
         ]
       }
@@ -23,7 +26,8 @@
   ],
   "data": [
     [
-      0
+      0,
+      1
     ]
   ]
 }

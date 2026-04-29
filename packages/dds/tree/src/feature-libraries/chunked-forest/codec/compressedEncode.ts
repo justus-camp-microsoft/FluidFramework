@@ -37,10 +37,25 @@ import {
 	type EncodedFieldBatchV1OrV2,
 	type EncodedNestedArrayShape,
 	type EncodedValueShape,
-	type FieldBatchFormatVersion,
+	FieldBatchFormatVersion,
 	SpecialField,
 	supportsIncrementalEncoding,
 } from "./format/index.js";
+
+/**
+ * Minimum number of consecutive same-shape sibling chunks required to be encoded as an
+ * {@link EncodedInlineArrayShape} run (one shape reference for the whole run) rather than
+ * one shape reference per chunk.
+ *
+ * @remarks
+ * The break-even point depends on the size of shape references on the wire (1–3 bytes each
+ * after JSON serialization) and the per-shape-table-entry cost of a new
+ * {@link EncodedInlineArrayShape} (~30 bytes serialized when not deduplicated). Caching by
+ * `(length, shape)` in {@link EncoderContext.inlineArrayShapeForRun} amortizes the
+ * shape-table cost when the same `(length, shape)` recurs across fields, which is common
+ * for uniform-content workloads (e.g. long runs of the same character).
+ */
+const RUN_DETECTION_MIN_LENGTH = 4;
 
 /**
  * Encode data from `FieldBatch` into an `EncodedFieldBatch`.
@@ -406,25 +421,97 @@ export class NestedArrayEncoder implements FieldEncoder {
 		context: EncoderContext,
 		outputBuffer: BufferFormat,
 	): void {
-		const buffer: BufferFormat = [];
-		let allNonZeroSize = true;
 		const length = cursor.getFieldLength();
-		forEachNode(cursor, () => {
-			const before = buffer.length;
-			this.innerEncoder.encodeNode(cursor, context, buffer);
-			allNonZeroSize &&= buffer.length - before !== 0;
-		});
-		if (buffer.length === 0) {
-			// This relies on the number of inner chunks being the same as the number of nodes.
-			// If making inner a `NodesEncoder`, this code will have to be adjusted accordingly.
-			outputBuffer.push(length);
-		} else {
-			assert(
-				allNonZeroSize,
-				0x73e /* either all or none of the members of a nested array must be 0 sized, or there is no way the decoder could process the content correctly. */,
-			);
-			outputBuffer.push(buffer);
+
+		// Run detection only fires for vText, where the polymorphic dispatch (inner shape =
+		// AnyShape) emits a per-node shape reference that can be hoisted when adjacent nodes
+		// share the same shape. For non-AnyShape inners, the field's wire shape already pins
+		// the inner shape once, so per-node references don't exist to dedupe.
+		const runDetectionApplies =
+			context.version === FieldBatchFormatVersion.vTextExperimental &&
+			this.innerEncoder.shape === AnyShape.instance;
+
+		if (!runDetectionApplies) {
+			const flatBuffer: BufferFormat = [];
+			let allNonZeroSize = true;
+			forEachNode(cursor, () => {
+				const before = flatBuffer.length;
+				this.innerEncoder.encodeNode(cursor, context, flatBuffer);
+				allNonZeroSize &&= flatBuffer.length - before !== 0;
+			});
+			if (flatBuffer.length === 0) {
+				// This relies on the number of inner chunks being the same as the number of nodes.
+				// If making inner a `NodesEncoder`, this code will have to be adjusted accordingly.
+				outputBuffer.push(length);
+			} else {
+				assert(
+					allNonZeroSize,
+					0x73e /* either all or none of the members of a nested array must be 0 sized, or there is no way the decoder could process the content correctly. */,
+				);
+				outputBuffer.push(flatBuffer);
+			}
+			return;
 		}
+
+		// Run-detection path: pre-encode each child into a side buffer, group adjacent children
+		// whose first emitted entry (the per-node shape reference pushed by AnyShape semantics)
+		// is the same, and emit each run of length >= RUN_DETECTION_MIN_LENGTH as one
+		// EncodedInlineArrayShape header followed by the concatenated data parts. Shorter runs
+		// keep the per-node shape-reference layout. The wire format remains a NestedArrayShape
+		// with inner=AnyShape; runs are valid AnyShape-dispatched chunks whose shape is
+		// EncodedInlineArrayShape, which is supported in v1 and later.
+		const sideBuffers: BufferFormat[] = [];
+		forEachNode(cursor, () => {
+			const sideBuf: BufferFormat = [];
+			this.innerEncoder.encodeNode(cursor, context, sideBuf);
+			sideBuffers.push(sideBuf);
+		});
+
+		if (sideBuffers.every((b) => b.length === 0)) {
+			outputBuffer.push(length);
+			return;
+		}
+
+		assert(
+			sideBuffers.every((b) => b.length > 0),
+			"either all or none of the members of a nested array must be 0 sized",
+		);
+
+		const buffer: BufferFormat = [];
+		let i = 0;
+		while (i < sideBuffers.length) {
+			const head = sideBuffers[i] ?? fail("missing side buffer");
+			const headShape = head[0];
+			let j = i + 1;
+			while (j < sideBuffers.length && sideBuffers[j]?.[0] === headShape) {
+				j++;
+			}
+			const runLength = j - i;
+			if (runLength >= RUN_DETECTION_MIN_LENGTH && headShape instanceof ShapeGeneric) {
+				const inlineShape = context.inlineArrayShapeForRun(runLength, headShape);
+				buffer.push(inlineShape);
+				for (let k = i; k < j; k++) {
+					// Skip the leading shape reference; the InlineArrayShape carries it once.
+					const child = sideBuffers[k] ?? fail("missing side buffer");
+					for (let m = 1; m < child.length; m++) {
+						const item = child[m];
+						if (item !== undefined) {
+							buffer.push(item);
+						}
+					}
+				}
+			} else {
+				for (let k = i; k < j; k++) {
+					const child = sideBuffers[k] ?? fail("missing side buffer");
+					for (const item of child) {
+						buffer.push(item);
+					}
+				}
+			}
+			i = j;
+		}
+
+		outputBuffer.push(buffer);
 	}
 }
 
@@ -529,6 +616,8 @@ export class EncoderContext implements NodeEncodeBuilder, FieldEncodeBuilder {
 	private readonly nodeEncodersFromSchema: Map<TreeNodeSchemaIdentifier, NodeEncoder> =
 		new Map();
 	private readonly nestedArrayEncoders: Map<NodeEncoder, NestedArrayEncoder> = new Map();
+	private readonly inlineArrayShapesForRun: Map<number, Map<Shape, InlineArrayEncoder>> =
+		new Map();
 	public constructor(
 		private readonly nodeEncoderFromPolicy: NodeEncoderPolicy,
 		private readonly fieldEncoderFromPolicy: FieldEncoderPolicy,
@@ -568,6 +657,35 @@ export class EncoderContext implements NodeEncodeBuilder, FieldEncodeBuilder {
 
 	public nestedArrayEncoder(inner: NodeEncoder): NestedArrayEncoder {
 		return getOrCreate(this.nestedArrayEncoders, inner, () => new NestedArrayEncoder(inner));
+	}
+
+	/**
+	 * Returns an {@link InlineArrayEncoder} representing a run of `length` chunks of `shape`.
+	 * Cached by `(length, shape)` so the resulting Shape is deduplicated in the shape table
+	 * across all uses within a single encode batch — this amortizes the per-shape-table-entry
+	 * cost when the same `(length, shape)` combination recurs (e.g. uniform-content fields).
+	 * @remarks
+	 * The returned encoder is intended for use as a Shape reference only — pushing it into a
+	 * BufferFormat to be replaced by its index at finalization time. Its `encodeNodes` is
+	 * unreachable; the data following the shape reference is provided directly by the caller.
+	 */
+	public inlineArrayShapeForRun(length: number, shape: Shape): InlineArrayEncoder {
+		let byShape = this.inlineArrayShapesForRun.get(length);
+		if (byShape === undefined) {
+			byShape = new Map();
+			this.inlineArrayShapesForRun.set(length, byShape);
+		}
+		let result = byShape.get(shape);
+		if (result === undefined) {
+			result = new InlineArrayEncoder(length, {
+				shape,
+				encodeNodes(): void {
+					fail("InlineArrayEncoder for run detection should not be invoked");
+				},
+			});
+			byShape.set(shape, result);
+		}
+		return result;
 	}
 }
 

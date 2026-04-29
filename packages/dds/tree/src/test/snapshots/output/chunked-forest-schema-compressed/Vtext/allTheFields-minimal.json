@@ -3,10 +3,10 @@
   "identifiers": [],
   "shapes": [
     {
-      "a": 1
+      "d": 0
     },
     {
-      "d": 0
+      "a": 0
     },
     {
       "c": {
@@ -15,15 +15,15 @@
         "fields": [
           [
             "optional",
-            0
-          ],
-          [
-            "valueField",
             1
           ],
           [
-            "sequence",
+            "valueField",
             0
+          ],
+          [
+            "sequence",
+            1
           ]
         ]
       }
@@ -37,6 +37,7 @@
   ],
   "data": [
     [
+      0,
       2,
       0,
       3,
