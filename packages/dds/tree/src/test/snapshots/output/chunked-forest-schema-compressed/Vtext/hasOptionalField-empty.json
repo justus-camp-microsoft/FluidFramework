@@ -18,10 +18,7 @@
       "a": 2
     },
     {
-      "c": {
-        "type": "com.fluidframework.leaf.number",
-        "value": true
-      }
+      "d": 0
     }
   ],
   "data": [

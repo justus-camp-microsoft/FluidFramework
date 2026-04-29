@@ -19,6 +19,7 @@ import {
 	Multiplicity,
 	identifierFieldKindIdentifier,
 	type SchemaPolicy,
+	type Value,
 	forEachField,
 	forEachNode,
 } from "../../../core/index.js";
@@ -169,6 +170,8 @@ function countFieldUnlessIncremental(
 		const encoder = context.nodeEncoderFromSchema(cursor.type);
 		if (encoder instanceof VTextObjectNodeEncoder) {
 			encoder.countNode(cursor);
+		} else if (encoder instanceof VTextLeafNodeEncoder) {
+			encoder.countNode(cursor);
 		}
 		const nodeType: string = cursor.type;
 		forEachField(cursor, () => {
@@ -195,6 +198,7 @@ function buildContextVText(
 	minOccurrencesForSpecialization: number,
 ): EncoderContext {
 	const vTextEncoders: VTextObjectNodeEncoder[] = [];
+	const vTextLeafEncoders: VTextLeafNodeEncoder[] = [];
 	const context: EncoderContext = new EncoderContext(
 		(fieldBuilder: FieldEncodeBuilder, schemaName: TreeNodeSchemaIdentifier) => {
 			const encoder = getNodeEncoderVText(
@@ -207,6 +211,8 @@ function buildContextVText(
 			);
 			if (encoder instanceof VTextObjectNodeEncoder) {
 				vTextEncoders.push(encoder);
+			} else if (encoder instanceof VTextLeafNodeEncoder) {
+				vTextLeafEncoders.push(encoder);
 			}
 			return encoder;
 		},
@@ -219,18 +225,30 @@ function buildContextVText(
 		(fieldBatch: FieldBatch, ctx: EncoderContext) => {
 			// Snapshot every existing encoder's batch state, then run the count pass against
 			// fresh state. New encoders created mid-batch (via lazy schema lookup) join
-			// `vTextEncoders` after this point — they start with empty state from their
-			// constructor, so they don't need a snapshot entry. On unwind, snapshotted
-			// encoders are restored; new-this-batch encoders get their state cleared so a
-			// later batch starts fresh.
-			const snapshots = new Map<VTextObjectNodeEncoder, VTextBatchState>();
+			// `vTextEncoders` / `vTextLeafEncoders` after this point — they start with empty
+			// state from their constructor, so they don't need a snapshot entry. On unwind,
+			// snapshotted encoders are restored; new-this-batch encoders get their state
+			// cleared so a later batch starts fresh.
+			const objectSnapshots = new Map<VTextObjectNodeEncoder, VTextBatchState>();
 			for (const enc of vTextEncoders) {
-				snapshots.set(enc, enc.swapBatchState());
+				objectSnapshots.set(enc, enc.swapBatchState());
+			}
+			const leafSnapshots = new Map<VTextLeafNodeEncoder, VTextLeafBatchState>();
+			for (const enc of vTextLeafEncoders) {
+				leafSnapshots.set(enc, enc.swapBatchState());
 			}
 			countVTextSpecializationCandidates(fieldBatch, ctx);
 			return () => {
 				for (const enc of vTextEncoders) {
-					const snapshot = snapshots.get(enc);
+					const snapshot = objectSnapshots.get(enc);
+					if (snapshot === undefined) {
+						enc.swapBatchState();
+					} else {
+						enc.restoreBatchState(snapshot);
+					}
+				}
+				for (const enc of vTextLeafEncoders) {
+					const snapshot = leafSnapshots.get(enc);
 					if (snapshot === undefined) {
 						enc.swapBatchState();
 					} else {
@@ -244,9 +262,18 @@ function buildContextVText(
 }
 
 /**
- * Like {@link getNodeEncoder} but wraps ObjectNodes that have required single-valued boolean
- * leaf fields in a {@link VTextObjectNodeEncoder} so those fields are constant-folded into
- * specialized shapes at encode time.
+ * Like {@link getNodeEncoder} but applies VText-specific specialization wrapping.
+ *
+ * @remarks
+ * ObjectNodes with required single-valued boolean leaf fields are wrapped in a
+ * {@link VTextObjectNodeEncoder} so those fields are constant-folded into specialized shapes.
+ *
+ * String/number LeafNodes are wrapped in a {@link VTextLeafNodeEncoder} so per-value cohorts
+ * that occur often enough get their value constant-folded into a specialized shape.
+ *
+ * Booleans are excluded as leaf-node candidates: with only two possible values, a specialized
+ * shape never beats the base shape's variable-boolean encoding once the AnyShape dispatch cost
+ * is paid. Identifier leaves (special-cased value shape) are likewise excluded.
  */
 function getNodeEncoderVText(
 	fieldBuilder: FieldEncodeBuilder,
@@ -265,6 +292,18 @@ function getNodeEncoderVText(
 
 	const schema =
 		storedSchema.nodeSchema.get(schemaName) ?? fail(0xb55 /* missing node schema */);
+
+	if (schema instanceof LeafNodeStoredSchema) {
+		if (schema.leafValue === ValueSchema.String || schema.leafValue === ValueSchema.Number) {
+			assert(
+				baseEncoder instanceof NodeShapeBasedEncoder,
+				"VText leaf encoder policy expects NodeShapeBasedEncoder as base",
+			);
+			return new VTextLeafNodeEncoder(baseEncoder, minOccurrencesForSpecialization);
+		}
+		return baseEncoder;
+	}
+
 	const boolFields: { key: FieldKey; type: TreeNodeSchemaIdentifier }[] = [];
 	if (schema instanceof ObjectNodeStoredSchema) {
 		for (const [key, field] of schema.objectNodeFields ?? []) {
@@ -423,6 +462,112 @@ class VTextObjectNodeEncoder implements NodeEncoder {
 		}
 		return new SpecializedNodeShapeEncoder(this.base, overrides);
 	}
+}
+
+/**
+ * Per-batch state for a {@link VTextLeafNodeEncoder}. Keyed on the encoded leaf value.
+ * Snapshotted/restored by the VText preEncodeHook for the same reasons as
+ * {@link VTextBatchState}.
+ */
+interface VTextLeafBatchState {
+	counts: Map<string, number>;
+	specializedEncoders: Map<string, SpecializedNodeShapeEncoder>;
+}
+
+function emptyVTextLeafBatchState(): VTextLeafBatchState {
+	return { counts: new Map(), specializedEncoders: new Map() };
+}
+
+/**
+ * Encodes a string- or number-valued leaf node, producing a {@link SpecializedNodeShapeEncoder}
+ * that constant-folds the leaf's value when that value occurs at least
+ * {@link MIN_OCCURRENCES_FOR_SPECIALIZATION} times in the batch.
+ *
+ * Counting and dispatch mirror {@link VTextObjectNodeEncoder}: pass 1 records each value's
+ * occurrence count, and pass 2 promotes each cohort that crosses the threshold to its own
+ * specialized shape; rarer values fall back to the base shape. The parent uses {@link AnyShape}
+ * dispatch so each leaf can carry its own shape index.
+ *
+ * The dispatch costs one extra token per leaf, while the specialized shape saves one token
+ * per leaf (the variable value), so this is roughly a wash in the average case. The win is
+ * concentrated in workloads where one value dominates an entire array — the parent could in
+ * principle skip AnyShape and inline the specialized leaf shape, but that optimization is not
+ * implemented here.
+ */
+class VTextLeafNodeEncoder implements NodeEncoder {
+	private readonly constantNodeEncoders: Map<string, SpecializedNodeShapeEncoder> = new Map();
+	private batch: VTextLeafBatchState = emptyVTextLeafBatchState();
+
+	public constructor(
+		private readonly base: NodeShapeBasedEncoder,
+		private readonly minOccurrencesForSpecialization: number,
+	) {}
+
+	public get shape(): AnyShape {
+		return AnyShape.instance;
+	}
+
+	/**
+	 * Counting-pass entry point. Records this leaf's value occurrence without producing output.
+	 */
+	public countNode(cursor: ITreeCursorSynchronous): void {
+		const key = valueKey(cursor.value);
+		this.batch.counts.set(key, (this.batch.counts.get(key) ?? 0) + 1);
+	}
+
+	public swapBatchState(): VTextLeafBatchState {
+		const previous = this.batch;
+		this.batch = emptyVTextLeafBatchState();
+		return previous;
+	}
+
+	public restoreBatchState(state: VTextLeafBatchState): void {
+		this.batch = state;
+	}
+
+	public encodeNode(
+		cursor: ITreeCursorSynchronous,
+		context: EncoderContext,
+		outputBuffer: BufferFormat,
+	): void {
+		const value = cursor.value;
+		const key = valueKey(value);
+		let specialized = this.batch.specializedEncoders.get(key);
+		if (
+			specialized === undefined &&
+			(this.batch.counts.get(key) ?? 0) >= this.minOccurrencesForSpecialization
+		) {
+			specialized = this.getOrCreateSpecialized(key, value);
+			this.batch.specializedEncoders.set(key, specialized);
+		}
+		AnyShape.encodeNode(cursor, context, outputBuffer, specialized ?? this.base);
+	}
+
+	private getOrCreateSpecialized(key: string, value: Value): SpecializedNodeShapeEncoder {
+		const cached = this.constantNodeEncoders.get(key);
+		if (cached !== undefined) {
+			return cached;
+		}
+		const specialized = new SpecializedNodeShapeEncoder(this.base, [], { value: [value] });
+		this.constantNodeEncoders.set(key, specialized);
+		return specialized;
+	}
+}
+
+/**
+ * Encodes a leaf value to a string suitable for use as a Map key. Strings, numbers, and
+ * booleans are unambiguous when prefixed with their type tag.
+ *
+ * {@link VTextLeafNodeEncoder} is only wired up for string/number leaves; other value types
+ * shouldn't reach this code path.
+ */
+function valueKey(value: Value): string {
+	const t = typeof value;
+	assert(
+		t === "string" || t === "number" || t === "boolean",
+		"VTextLeafNodeEncoder only supports primitive leaf values",
+	);
+	return `${t}:${value as string | number | boolean}`;
 }
 
 /**

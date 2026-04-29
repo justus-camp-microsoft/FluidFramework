@@ -4,31 +4,36 @@
   "shapes": [
     {
       "c": {
-        "type": "test.numericRecord",
-        "value": false,
-        "extraFields": 1
-      }
-    },
-    {
-      "a": 2
-    },
-    {
-      "c": {
         "type": "com.fluidframework.leaf.number",
         "value": true
       }
+    },
+    {
+      "c": {
+        "type": "test.numericRecord",
+        "value": false,
+        "extraFields": 2
+      }
+    },
+    {
+      "a": 3
+    },
+    {
+      "d": 0
     }
   ],
   "data": [
     [
-      0,
+      1,
       [
         "a",
         [
+          0,
           5
         ],
         "b",
         [
+          0,
           6
         ]
       ]

@@ -3,6 +3,9 @@
   "identifiers": [],
   "shapes": [
     {
+      "d": 0
+    },
+    {
       "c": {
         "type": "com.fluidframework.leaf.number",
         "value": true
@@ -12,6 +15,7 @@
   "data": [
     [
       0,
+      1,
       5
     ]
   ]

@@ -3,13 +3,16 @@
   "identifiers": [],
   "shapes": [
     {
+      "d": 0
+    },
+    {
       "c": {
         "type": "test.hasPolymorphicValueField",
         "value": false,
         "fields": [
           [
             "field",
-            2
+            0
           ]
         ]
       }
@@ -19,15 +22,13 @@
         "type": "com.fluidframework.leaf.number",
         "value": true
       }
-    },
-    {
-      "d": 0
     }
   ],
   "data": [
     [
-      0,
       1,
+      0,
+      2,
       5
     ]
   ]
