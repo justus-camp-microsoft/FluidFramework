@@ -46,11 +46,15 @@ import {
 	type EncodedFieldBatchV1,
 	type EncodedFieldBatchV1OrV2,
 	type EncodedFieldBatchV2,
+	type EncodedFieldBatchVTextExperimental,
 	type EncodedValueShape,
 	FieldBatchFormatVersion,
 	SpecialField,
 } from "./format/index.js";
-import { defaultIncrementalEncodingPolicy } from "./incrementalEncodingPolicy.js";
+import {
+	defaultIncrementalEncodingPolicy,
+	type IncrementalEncodingPolicy,
+} from "./incrementalEncodingPolicy.js";
 import { NodeShapeBasedEncoder, SpecializedNodeShapeEncoder } from "./nodeEncoder.js";
 
 /**
@@ -121,7 +125,7 @@ export function schemaCompressedEncodeVTextExperimental(
 	idCompressor: IIdCompressor,
 	incrementalEncoder: IncrementalEncoder | undefined,
 	minOccurrencesForSpecialization: number = DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION,
-): EncodedFieldBatchV2 {
+): EncodedFieldBatchVTextExperimental {
 	const context = buildContextVText(
 		schema,
 		policy,
@@ -130,7 +134,13 @@ export function schemaCompressedEncodeVTextExperimental(
 		brand(FieldBatchFormatVersion.vTextExperimental),
 		minOccurrencesForSpecialization,
 	);
-	return compressedEncode(fieldBatch, context) as EncodedFieldBatchV2;
+	// `compressedEncode`'s return type is too narrow to express the vTextExperimental version
+	// (its `version` field is `"text"`, not 1 or 2). The runtime shape matches
+	// `EncodedFieldBatchVTextExperimental`; the double cast bridges the static type only.
+	return compressedEncode(
+		fieldBatch,
+		context,
+	) as unknown as EncodedFieldBatchVTextExperimental;
 }
 
 /**
@@ -142,47 +152,71 @@ export function schemaCompressedEncodeVTextExperimental(
  * Fields that the {@link IncrementalEncoder} will encode out-of-band are skipped: their
  * sub-chunks get their own count pass when `compressedEncode` is invoked recursively for
  * each chunk, so counting them here would inflate the outer batch's totals with nodes that
- * the outer batch does not actually emit. Each `forEachNode`/`forEachField` walk returns
- * its cursor to the starting position, so the same `fieldBatch` cursors are re-walkable by
+ * the outer batch does not actually emit. The policy is invoked with the same arguments
+ * that {@link getNodeEncoder} uses, per the {@link IncrementalEncodingPolicy} contract:
+ * per-field-key for ObjectNode/ArrayNode parents, per-node (with `fieldKey` undefined) for
+ * MapNode/RecordNode parents. Each `forEachNode`/`forEachField` walk returns its cursor to
+ * the starting position, so the same `fieldBatch` cursors are re-walkable by
  * `compressedEncode` in pass 2.
  */
 function countVTextSpecializationCandidates(
 	fieldBatch: FieldBatch,
 	context: EncoderContext,
+	storedSchema: StoredSchemaCollection,
 ): void {
 	const shouldEncodeIncrementally = context.incrementalEncoder?.shouldEncodeIncrementally;
 	for (const cursor of fieldBatch) {
-		countFieldUnlessIncremental(cursor, context, undefined, shouldEncodeIncrementally);
+		forEachNode(cursor, () => {
+			countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+		});
 	}
 }
 
-function countFieldUnlessIncremental(
+function countNodeAndDescendants(
 	cursor: ITreeCursorSynchronous,
 	context: EncoderContext,
-	parentNodeType: string | undefined,
-	shouldEncodeIncrementally:
-		| ((nodeType: string | undefined, fieldKey: string) => boolean)
-		| undefined,
+	storedSchema: StoredSchemaCollection,
+	shouldEncodeIncrementally: IncrementalEncodingPolicy | undefined,
 ): void {
-	if (shouldEncodeIncrementally?.(parentNodeType, cursor.getFieldKey()) === true) {
-		return;
-	}
-	forEachNode(cursor, () => {
-		// Walk children first (post-order) so leaf-value cohorts and inner object cohorts have
-		// their counts and threshold decisions populated before this node's cohort key is built.
-		// {@link VTextObjectNodeEncoder.countNode} computes its tuple via `resolveShape` on each
-		// child encoder, which is only correct after the child has been fully counted.
-		const nodeType: string = cursor.type;
+	const nodeType: TreeNodeSchemaIdentifier = cursor.type;
+	const schema = storedSchema.nodeSchema.get(nodeType);
+	if (schema instanceof ObjectNodeStoredSchema) {
+		// Object/Array: per-field policy decision. The cursor's field key is the object field
+		// key for objects, or "" for arrays — both forms the contract accepts.
 		forEachField(cursor, () => {
-			countFieldUnlessIncremental(cursor, context, nodeType, shouldEncodeIncrementally);
+			if (shouldEncodeIncrementally?.(nodeType, cursor.getFieldKey()) === true) {
+				return;
+			}
+			forEachNode(cursor, () => {
+				countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+			});
 		});
-		const encoder = context.nodeEncoderFromSchema(cursor.type);
-		if (encoder instanceof VTextObjectNodeEncoder) {
-			encoder.countNode(cursor);
-		} else if (encoder instanceof VTextLeafNodeEncoder) {
-			encoder.countNode(cursor);
+	} else if (schema instanceof MapNodeStoredSchema) {
+		// Map/Record: per-node policy decision; the contract requires fieldKey to be undefined.
+		// Mirrors the single shouldEncodeIncrementally(schemaName) call in getNodeEncoder.
+		if (shouldEncodeIncrementally?.(nodeType) === true) {
+			return;
 		}
-	});
+		forEachField(cursor, () => {
+			forEachNode(cursor, () => {
+				countNodeAndDescendants(cursor, context, storedSchema, shouldEncodeIncrementally);
+			});
+		});
+	}
+	// Leaf nodes (LeafNodeStoredSchema): no fields, no policy call. Unknown schemas would
+	// have already failed `nodeEncoderFromSchema` below.
+	//
+	// Post-order: count this node after its descendants so leaf-value cohorts and inner
+	// object cohorts have their counts and threshold decisions populated before this node's
+	// cohort key is built. {@link VTextObjectNodeEncoder.countNode} computes its tuple via
+	// `resolveShape` on each child encoder, which is only correct after the child has been
+	// fully counted.
+	const encoder = context.nodeEncoderFromSchema(nodeType);
+	if (encoder instanceof VTextObjectNodeEncoder) {
+		encoder.countNode(cursor);
+	} else if (encoder instanceof VTextLeafNodeEncoder) {
+		encoder.countNode(cursor);
+	}
 }
 
 /**
@@ -249,7 +283,7 @@ function buildContextVText(
 			// to defend against pathological cases (e.g. a deeply recursive schema where
 			// thresholds keep flipping).
 			for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
-				countVTextSpecializationCandidates(fieldBatch, ctx);
+				countVTextSpecializationCandidates(fieldBatch, ctx, storedSchema);
 				let changed = false;
 				for (const enc of vTextEncoders) {
 					if (enc.commitCountIteration()) changed = true;

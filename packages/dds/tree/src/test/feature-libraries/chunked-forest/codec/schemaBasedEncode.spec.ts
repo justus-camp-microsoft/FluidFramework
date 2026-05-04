@@ -43,6 +43,7 @@ import {
 import {
 	FieldBatchFormatVersion,
 	type EncodedFieldBatchV2,
+	type EncodedFieldBatchVTextExperimental,
 	SpecialField,
 	// eslint-disable-next-line import-x/no-internal-modules
 } from "../../../../feature-libraries/chunked-forest/codec/format/index.js";
@@ -467,6 +468,10 @@ describe("schemaBasedEncoding", () => {
 	});
 
 	describe("schemaCompressedEncodeVTextExperimental", () => {
+		const countSpecializedShapes = (
+			batch: EncodedFieldBatchV2 | EncodedFieldBatchVTextExperimental,
+		): number => batch.shapes.filter((s) => (s as { f?: unknown }).f !== undefined).length;
+
 		it("round-trips an object with boolean fields and emits f shapes", () => {
 			const sf = new SchemaFactoryAlpha("fmt");
 			class CharacterFormat extends sf.object("CharacterFormat", {
@@ -602,11 +607,8 @@ describe("schemaBasedEncoding", () => {
 				minOccurrencesForSpecialization,
 			);
 
-			const countSpecialized = (batch: EncodedFieldBatchV2): number =>
-				batch.shapes.filter((s) => (s as { f?: unknown }).f !== undefined).length;
-
 			assert.equal(
-				countSpecialized(encoded),
+				countSpecializedShapes(encoded),
 				1,
 				"outer batch should specialize the above-threshold inline tuple",
 			);
@@ -618,10 +620,77 @@ describe("schemaBasedEncoding", () => {
 			);
 			const subBatch = subEncodings[0] ?? assert.fail("missing sub-chunk encoding");
 			assert.equal(
-				countSpecialized(subBatch),
+				countSpecializedShapes(subBatch),
 				0,
 				"sub-chunk should not specialize: its 1-instance count is below threshold",
 			);
+		});
+
+		it("encodes a tree containing a Map node under the Alpha incremental policy without throwing", () => {
+			// Regression: pass-1 used to call shouldEncodeIncrementally(parentType, fieldKey)
+			// for every field, regardless of parent kind. The Alpha reference policy throws
+			// `Field key must not be provided for leaf, map or record node ...` whenever a
+			// non-undefined fieldKey reaches a Map/Record/Leaf parent. So encoding any tree
+			// containing a Map node would crash during the count pass before the fix.
+			const sf = new SchemaFactoryAlpha("vtext-map-test");
+			class CharacterFormat extends sf.object("CharacterFormat", {
+				bold: sf.boolean,
+				italic: sf.boolean,
+			}) {}
+			class FormatMap extends sf.map("FormatMap", CharacterFormat) {}
+			class Doc extends sf.object("Doc", {
+				map: FormatMap,
+			}) {}
+
+			const storedSchema = toStoredSchema(Doc, restrictiveStoredSchemaGenerationOptions);
+			const idCompressor = createIdCompressor(
+				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
+			);
+
+			// Two CharacterFormat children inside a Map: same boolean tuple, threshold=2 →
+			// the count pass must visit both (correctly evaluating the Map parent's policy
+			// once with undefined fieldKey) and the encode pass must specialize.
+			const minOccurrencesForSpecialization = 2;
+			const doc = new Doc({
+				map: new FormatMap(
+					new Map([
+						["a", new CharacterFormat({ bold: true, italic: false })],
+						["b", new CharacterFormat({ bold: true, italic: false })],
+					]),
+				),
+			});
+
+			const incEncoder: IncrementalEncoder = {
+				shouldEncodeIncrementally: incrementalEncodingPolicyForAllowedTypes(
+					new TreeViewConfigurationAlpha({ schema: Doc }),
+				),
+				encodeIncrementalField: () =>
+					assert.fail("no incremental encoding expected for this schema"),
+			};
+
+			const encoded = schemaCompressedEncodeVTextExperimental(
+				storedSchema,
+				defaultSchemaPolicy,
+				[fieldCursorFromInsertable<UnsafeUnknownSchema>(Doc, doc)],
+				idCompressor,
+				incEncoder,
+				minOccurrencesForSpecialization,
+			);
+
+			assert.equal(
+				countSpecializedShapes(encoded),
+				1,
+				"the (true,false) tuple appears twice and should produce one specialized shape",
+			);
+
+			// Round-trip to confirm the encoded data is decodable.
+			const idCompressorCore = toIdCompressorWithCore(idCompressor);
+			idCompressorCore.finalizeCreationRange(idCompressorCore.takeNextCreationRange());
+			const decoded = decode(encoded as unknown as Parameters<typeof decode>[0], {
+				idCompressor,
+				originatorId: idCompressor.localSessionId,
+			});
+			assert.equal(decoded.length, 1, "expected one decoded field per batch entry");
 		});
 	});
 
