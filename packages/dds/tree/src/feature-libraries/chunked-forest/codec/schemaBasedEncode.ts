@@ -113,10 +113,7 @@ export function schemaCompressedEncodeV2(
  * Applies the specialized-node-shape (`f`) optimization: required single-valued boolean leaf
  * fields within ObjectNodes are constant-folded into the shape, reducing stream tokens for
  * nodes such as `CharacterFormat` where format flags are identical across many characters.
- * @param minOccurrencesForSpecialization - Minimum number of times a given boolean-value tuple
- * must appear in a single batch to be promoted to a specialized shape. Defaults to
- * {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION}. Lowering this is primarily useful for
- * tests that want to exercise specialization with small inputs.
+ * Uses the default specialization threshold {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION}.
  */
 export function schemaCompressedEncodeVTextExperimental(
 	schema: StoredSchemaCollection,
@@ -124,7 +121,31 @@ export function schemaCompressedEncodeVTextExperimental(
 	fieldBatch: FieldBatch,
 	idCompressor: IIdCompressor,
 	incrementalEncoder: IncrementalEncoder | undefined,
-	minOccurrencesForSpecialization: number = DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION,
+): EncodedFieldBatchVTextExperimental {
+	return schemaCompressedEncodeVTextExperimentalForTests(
+		schema,
+		policy,
+		fieldBatch,
+		idCompressor,
+		incrementalEncoder,
+		DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION,
+	);
+}
+
+/**
+ * Test-only variant of {@link schemaCompressedEncodeVTextExperimental} that accepts a custom
+ * `minOccurrencesForSpecialization` threshold so small test inputs can exercise the
+ * specialization heuristic. Production callers must use
+ * {@link schemaCompressedEncodeVTextExperimental}, which hard-codes
+ * {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION}.
+ */
+export function schemaCompressedEncodeVTextExperimentalForTests(
+	schema: StoredSchemaCollection,
+	policy: SchemaPolicy,
+	fieldBatch: FieldBatch,
+	idCompressor: IIdCompressor,
+	incrementalEncoder: IncrementalEncoder | undefined,
+	minOccurrencesForSpecialization: number,
 ): EncodedFieldBatchVTextExperimental {
 	const context = buildContextVText(
 		schema,
@@ -276,24 +297,7 @@ function buildContextVText(
 			for (const enc of vTextLeafEncoders) {
 				leafSnapshots.set(enc, enc.swapBatchState());
 			}
-			// Multi-pass count: each iteration's `resolveShape` reads counts populated by the
-			// previous iteration, so cohort decisions propagate up the tree one nesting level
-			// per pass. Iterates until counts stabilize, bounded by COUNT_PASS_MAX_ITERATIONS.
-			// For text-domain schemas convergence is reached in ~2–4 passes; the bound exists
-			// to defend against pathological cases (e.g. a deeply recursive schema where
-			// thresholds keep flipping).
-			for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
-				countVTextSpecializationCandidates(fieldBatch, ctx, storedSchema);
-				let changed = false;
-				for (const enc of vTextEncoders) {
-					if (enc.commitCountIteration()) changed = true;
-				}
-				for (const enc of vTextLeafEncoders) {
-					if (enc.commitCountIteration()) changed = true;
-				}
-				if (!changed) break;
-			}
-			return () => {
+			const restore = (): void => {
 				for (const enc of vTextEncoders) {
 					const snapshot = objectSnapshots.get(enc);
 					if (snapshot === undefined) {
@@ -311,6 +315,33 @@ function buildContextVText(
 					}
 				}
 			};
+			// Per the {@link PreEncodeHook} contract, if counting throws after snapshotting
+			// state, we must restore that state before rethrowing — otherwise the next encode
+			// on this context starts with the snapshotted-empty state and the original
+			// counts/specializedEncoders are lost forever.
+			try {
+				// Multi-pass count: each iteration's `resolveShape` reads counts populated by the
+				// previous iteration, so cohort decisions propagate up the tree one nesting level
+				// per pass. Iterates until counts stabilize, bounded by COUNT_PASS_MAX_ITERATIONS.
+				// For text-domain schemas convergence is reached in ~2–4 passes; the bound exists
+				// to defend against pathological cases (e.g. a deeply recursive schema where
+				// thresholds keep flipping).
+				for (let i = 0; i < COUNT_PASS_MAX_ITERATIONS; i++) {
+					countVTextSpecializationCandidates(fieldBatch, ctx, storedSchema);
+					let changed = false;
+					for (const enc of vTextEncoders) {
+						if (enc.commitCountIteration()) changed = true;
+					}
+					for (const enc of vTextLeafEncoders) {
+						if (enc.commitCountIteration()) changed = true;
+					}
+					if (!changed) break;
+				}
+			} catch (error) {
+				restore();
+				throw error;
+			}
+			return restore;
 		},
 	);
 	return context;
@@ -363,6 +394,12 @@ function getNodeEncoderVText(
 	if (schema instanceof ObjectNodeStoredSchema) {
 		for (const [key, field] of schema.objectNodeFields ?? []) {
 			if (context.fieldShapes.get(field.kind)?.multiplicity !== Multiplicity.Single) {
+				continue;
+			}
+			// Defer to the caller's incremental policy: if a field is meant to be encoded
+			// out-of-band, constant-folding its value into a specialized shape would silently
+			// override that decision.
+			if (incrementalEncoder?.shouldEncodeIncrementally?.(schemaName, key) === true) {
 				continue;
 			}
 			const type = oneFromIterable(field.types);
@@ -490,6 +527,20 @@ function emptyVTextBatchState(): VTextBatchState {
 	return { counts: new Map(), resolveCounts: new Map(), specializedEncoders: new Map() };
 }
 
+/**
+ * Encodes ObjectNodes using {@link SpecializedNodeShapeEncoder} shapes that constant-fold
+ * required single-valued boolean leaf fields.
+ *
+ * Used in a two-pass encode: a counting pass ({@link VTextObjectNodeEncoder.countNode}) records
+ * each tuple's occurrence count, after which the encoding pass
+ * ({@link VTextObjectNodeEncoder.encodeNode}) consults those counts to decide on first sight
+ * whether to specialize. Tuples that occur at least `minOccurrencesForSpecialization` times
+ * (default {@link DEFAULT_MIN_OCCURRENCES_FOR_SPECIALIZATION}) use a specialized shape for
+ * *all* their occurrences; rarer tuples encode through the base shape. The parent field uses
+ * {@link AnyShape} dispatch so each node can carry its own shape index — paying one extra
+ * dispatch token per node but saving one token per boolean field that gets embedded as a
+ * constant in the specialized shape.
+ */
 class VTextObjectNodeEncoder implements NodeEncoder {
 	private readonly constantNodeEncoders: Map<string, NodeShapeBasedEncoder> = new Map();
 	/**

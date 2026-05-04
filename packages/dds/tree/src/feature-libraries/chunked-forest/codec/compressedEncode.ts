@@ -719,6 +719,11 @@ export type NodeEncoderPolicy = (
  * (in a `finally` block) after the encode completes — typically used to restore state
  * snapshotted at hook entry, so recursive sub-chunk encodes do not corrupt the outer
  * batch's state when they unwind.
+ *
+ * @remarks
+ * Contract: cleanup runs only if the hook returns. If the hook itself throws *after*
+ * mutating state (e.g. mid-snapshot), it is responsible for restoring that state before
+ * rethrowing — `compressedEncode` does not catch hook exceptions.
  */
 export type PreEncodeHook = (
 	fieldBatch: FieldBatch,

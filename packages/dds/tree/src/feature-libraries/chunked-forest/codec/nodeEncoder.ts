@@ -189,6 +189,13 @@ export class SpecializedNodeShapeEncoder
 	) {
 		super();
 		const overrideMap = new Map(fieldOverrides.map((kfe) => [kfe.key, kfe]));
+		// Mirrors the decoder-side check in `applySpecialization` — duplicate keys silently
+		// drop earlier overrides via the Map and would also be appended twice into
+		// `mergedFields` below, producing a wire format the decoder rejects.
+		assert(
+			overrideMap.size === fieldOverrides.length,
+			"duplicate field key in SpecializedNodeShapeEncoder fieldOverrides",
+		);
 		const mergedFields: KeyedFieldEncoder[] = base.specializedFieldEncoders.map(
 			(kfe) => overrideMap.get(kfe.key) ?? kfe,
 		);

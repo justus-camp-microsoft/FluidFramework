@@ -10,9 +10,11 @@ import {
 	toIdCompressorWithCore,
 } from "@fluidframework/id-compressor/internal";
 import { isFluidHandle } from "@fluidframework/runtime-utils/internal";
+import { validateAssertionError } from "@fluidframework/test-runtime-utils/internal";
 
 import { currentVersion } from "../../../../codec/index.js";
 import type {
+	FieldKey,
 	ITreeCursorSynchronous,
 	JsonableTree,
 	TreeChunk,
@@ -47,13 +49,16 @@ import {
 	SpecialField,
 	// eslint-disable-next-line import-x/no-internal-modules
 } from "../../../../feature-libraries/chunked-forest/codec/format/index.js";
-// eslint-disable-next-line import-x/no-internal-modules
-import { NodeShapeBasedEncoder } from "../../../../feature-libraries/chunked-forest/codec/nodeEncoder.js";
+import {
+	NodeShapeBasedEncoder,
+	SpecializedNodeShapeEncoder,
+	// eslint-disable-next-line import-x/no-internal-modules
+} from "../../../../feature-libraries/chunked-forest/codec/nodeEncoder.js";
 import {
 	buildContext,
 	getFieldEncoder,
 	getNodeEncoder,
-	schemaCompressedEncodeVTextExperimental,
+	schemaCompressedEncodeVTextExperimentalForTests,
 	// eslint-disable-next-line import-x/no-internal-modules
 } from "../../../../feature-libraries/chunked-forest/codec/schemaBasedEncode.js";
 // eslint-disable-next-line import-x/no-internal-modules
@@ -508,7 +513,7 @@ describe("schemaBasedEncoding", () => {
 			const belowThreshold = [makeFormat(false, true)];
 			const tree = [...aboveThreshold, ...belowThreshold];
 
-			const encoded = schemaCompressedEncodeVTextExperimental(
+			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
 				storedSchema,
 				defaultSchemaPolicy,
 				[cursorForJsonableTreeField(tree)],
@@ -518,11 +523,8 @@ describe("schemaBasedEncoding", () => {
 			);
 
 			// Exactly one specialized shape: only the above-threshold tuple is folded.
-			const specializedShapeCount = encoded.shapes.filter(
-				(s) => (s as { f?: unknown }).f !== undefined,
-			).length;
 			assert.equal(
-				specializedShapeCount,
+				countSpecializedShapes(encoded),
 				1,
 				"only the above-threshold tuple should produce a specialized shape",
 			);
@@ -598,7 +600,7 @@ describe("schemaBasedEncoding", () => {
 				},
 			};
 
-			const encoded = schemaCompressedEncodeVTextExperimental(
+			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
 				storedSchema,
 				defaultSchemaPolicy,
 				[fieldCursorFromInsertable<UnsafeUnknownSchema>(Doc, doc)],
@@ -668,7 +670,7 @@ describe("schemaBasedEncoding", () => {
 					assert.fail("no incremental encoding expected for this schema"),
 			};
 
-			const encoded = schemaCompressedEncodeVTextExperimental(
+			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
 				storedSchema,
 				defaultSchemaPolicy,
 				[fieldCursorFromInsertable<UnsafeUnknownSchema>(Doc, doc)],
@@ -691,6 +693,113 @@ describe("schemaBasedEncoding", () => {
 				originatorId: idCompressor.localSessionId,
 			});
 			assert.equal(decoded.length, 1, "expected one decoded field per batch entry");
+		});
+
+		it("SpecializedNodeShapeEncoder asserts on duplicate keys in fieldOverrides", () => {
+			// Regression: the constructor used to silently mishandle duplicates — Map-based
+			// merge dropped earlier overrides for base-collisions, and non-base duplicates
+			// were appended twice into the merged-fields list. The decoder rejects such
+			// shapes at decode time, but the encoder claimed success.
+			const base = new NodeShapeBasedEncoder(
+				brand<TreeNodeSchemaIdentifier>("Base"),
+				false,
+				[],
+				undefined,
+			);
+			const leaf = new NodeShapeBasedEncoder(
+				brand<TreeNodeSchemaIdentifier>("leaf"),
+				true,
+				[],
+				undefined,
+			);
+			const dupKey = brand<FieldKey>("k");
+			assert.throws(
+				() =>
+					new SpecializedNodeShapeEncoder(base, [
+						{ key: dupKey, encoder: anyFieldEncoder },
+						{ key: dupKey, encoder: { encodeField: leaf.encodeNode.bind(leaf), shape: leaf } },
+					]),
+				validateAssertionError(
+					"duplicate field key in SpecializedNodeShapeEncoder fieldOverrides",
+				),
+			);
+		});
+
+		it("does not specialize a boolean field that the incremental policy marks as incremental", () => {
+			// Regression: getNodeEncoderVText used to include all required boolean leaves in
+			// boolFields without consulting the incremental policy. If a policy marked a
+			// boolean field as incremental, getNodeEncoder would substitute incrementalFieldEncoder
+			// in the base shape, but VText would still pull a constant value out and emit a
+			// specialized shape — silently overriding the caller's incremental decision.
+			const sf = new SchemaFactoryAlpha("vtext-inc-bool");
+			class Format extends sf.object("Format", {
+				bold: sf.boolean,
+			}) {}
+
+			const storedSchema = toStoredSchema(Format, restrictiveStoredSchemaGenerationOptions);
+			const idCompressor = createIdCompressor(
+				assertIsSessionId("00000000-0000-4000-b000-000000000000"),
+			);
+
+			const tree = Array.from(
+				{ length: 5 },
+				(): JsonableTree => ({
+					type: brand<TreeNodeSchemaIdentifier>(Format.identifier),
+					fields: {
+						bold: [
+							{
+								type: brand<TreeNodeSchemaIdentifier>(booleanSchema.identifier),
+								value: true,
+							},
+						],
+					},
+				}),
+			);
+
+			// Custom policy that marks Format.bold as incremental. The policy returns false
+			// for the root field (parent undefined) and for any other call.
+			const customPolicy = (nodeId: string | undefined, fieldKey?: string): boolean =>
+				nodeId === Format.identifier && fieldKey === "bold";
+
+			let chunkEncoderCalls = 0;
+			let nextRefId = 1;
+			const incEncoder: IncrementalEncoder = {
+				shouldEncodeIncrementally: customPolicy,
+				encodeIncrementalField: (cursor, chunkEncoder) => {
+					const chunk = chunkFieldSingle(cursor, {
+						idCompressor,
+						policy: defaultChunkPolicy,
+					});
+					try {
+						chunkEncoder(chunk);
+						chunkEncoderCalls += 1;
+					} finally {
+						chunk.referenceRemoved();
+					}
+					return [brand<ChunkReferenceId>(nextRefId++)];
+				},
+			};
+
+			const encoded = schemaCompressedEncodeVTextExperimentalForTests(
+				storedSchema,
+				defaultSchemaPolicy,
+				[cursorForJsonableTreeField(tree)],
+				idCompressor,
+				incEncoder,
+				2 /* minOccurrencesForSpecialization */,
+			);
+
+			// Without the fix, the bold field would have been folded into a specialized shape
+			// (count=5 >= threshold=2), producing 1 specialized shape and 0 incremental calls.
+			assert.equal(
+				countSpecializedShapes(encoded),
+				0,
+				"the only candidate field is incremental — no specialized shapes should be produced",
+			);
+			assert.ok(
+				chunkEncoderCalls > 0,
+				"the incremental encoder should have been invoked for the bold field",
+			);
 		});
 	});
 
